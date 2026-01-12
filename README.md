@@ -6,7 +6,7 @@
 
 **A concise technical write-up summarizing the experiments in this repository:**
 
-**[Global PCA Microstudy (PDF)](docs/global_pca_microstudy_v2.pdf)**
+**[Global PCA Microstudy (PDF)](https://github.com/Danish-Ahmed007/Slicegpt-Global-Rotations/raw/main/docs/global_pca_microstudy_v2.pdf)**
 
 This document describes the experimental setup, implementation details, and empirical results for global and K-block PCA rotations in SliceGPT.
 
