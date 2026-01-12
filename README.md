@@ -2,6 +2,16 @@
 
 > **This is a fork of [microsoft/TransformerCompression](https://github.com/microsoft/TransformerCompression)**
 
+## Technical Note
+
+**A concise technical write-up summarizing the experiments in this repository:**
+
+**[Global PCA Microstudy (PDF)](docs/global_pca_microstudy_v2.pdf)**
+
+This document describes the experimental setup, implementation details, and empirical results for global and K-block PCA rotations in SliceGPT.
+
+---
+
 This repository extends SliceGPT with **Global PCA rotation**, an alternative to per-layer PCA that uses a single rotation matrix for all transformer layers. This achieves significant memory savings with minimal perplexity impact.
 
 ## What's New
@@ -24,9 +34,9 @@ Instead of computing a separate rotation matrix Q for each layer (per-layer PCA)
 | OPT-6.7B | 12.31 | 13.53 | +10% | 1,134 MB |
 | LLaMA-7B | 6.24 | 6.79 | +9% | - |
 
-[Perplexity Comparison](docs/images/fig1_ppl_comparison_all.png)
+![Perplexity Comparison](docs/images/fig1_ppl_comparison_all.png)
 
-[Memory Savings](docs/images/fig4_memory_savings.png)
+![Memory Savings](docs/images/fig4_memory_savings.png)
 
 ---
 
