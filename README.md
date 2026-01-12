@@ -1,168 +1,144 @@
-# Transformer Compression with SliceGPT
+# SliceGPT with Global PCA Extension
 
-This repository contains the code for the paper [SliceGPT](https://arxiv.org/abs/2401.15024) (ICLR'24). Also discussed on [Hugging Face](https://huggingface.co/papers/2401.15024). 
+> **This is a fork of [microsoft/TransformerCompression](https://github.com/microsoft/TransformerCompression)**
 
-SliceGPT is a new post-training sparsification scheme that makes transformer networks (including LLMs) smaller by 
-first applying orthogonal transformations to each transformer layer that leave the model unchanged, and then slicing off the 
-least-significant rows and columns (chosen by the eigenvalue decay) of the weight matrices. The model structure is 
-left unchanged, but each weight matrix is replaced by a smaller (dense) weight matrix, reducing the embedding dimension 
-of the model. This results in speedups (without any additional code optimization) and a reduced memory footprint.  
+This repository extends SliceGPT with **Global PCA rotation**, an alternative to per-layer PCA that uses a single rotation matrix for all transformer layers. This achieves significant memory savings with minimal perplexity impact.
 
-The code is arranged as a package `slicegpt` in `/src`, and scripts to replicate experiments from the paper are in 
-`/experiments`. To install the `slicegpt` package, we recommend
+## What's New
 
-```
-    pip install -e .[experiment]
-```
+### Global PCA Rotation
 
-## Running SliceGPT
+Instead of computing a separate rotation matrix Q for each layer (per-layer PCA), Global PCA computes **one rotation matrix from all layer activations** and applies it uniformly.
 
-To run SliceGPT on `microsoft/phi-2`, from the `experiments` folder, run 
-```
-    python run_slicegpt.py \
-           --model microsoft/phi-2 \
-           --save-dir dir/to/save/sliced_model/in \
-           --sparsity 0.25 \
-           --device cuda:0 \
-           --eval-baseline \
-           --no-wandb
-```
+**Benefits:**
+- **97% reduction** in shortcut matrix memory (e.g., 1.1 GB → 30 MB for OPT-6.7B)
+- **2× faster** compression time (single eigendecomposition vs. one per layer)
+- **Only ~10% higher perplexity** compared to per-layer PCA
 
-This will compress the `microsoft/phi-2` model and save the compressed model to the specified directory. Please consult 
-the script for the full set of options.
+### Key Results
 
-_Note:_ For models that require Hugging Face authentication, set the `--hf-token` argument 
-manually or using a key vault. Alternatively, set the environment variable `HF_TOKEN`.
+| Model | Per-Layer PPL | Global PPL | Δ PPL | Memory Saved |
+|-------|---------------|------------|-------|--------------|
+| OPT-125M | 39.60 | 44.31 | +12% | 14.5 MB |
+| OPT-1.3B | 17.93 | 19.92 | +11% | 211.5 MB |
+| OPT-6.7B | 12.31 | 13.53 | +10% | 1,134 MB |
+| LLaMA-7B | 6.24 | 6.79 | +9% | - |
 
-### Recovery fine-tuning
+[Perplexity Comparison](docs/images/fig1_ppl_comparison_all.png)
 
-To install additional dependencies required for post-slicing recovery fine-tuning (RFT):
+[Memory Savings](docs/images/fig4_memory_savings.png)
 
-```
-    pip install -e .[experiment,finetune]
-```
+---
 
-The following replicates the experiments in the paper (LoRA hyperparams valid for all Llama-2 and Phi-2 models): 
-```
-    python run_finetuning.py \
-           --model microsoft/phi-2 \
-           --sliced-model-path path/to/sliced \
-           --save-dir dir/to/save/finetuned_model/in \
-           --sparsity 0.25 \
-           --device cuda:0 \
-           --ppl-eval-dataset alpaca \
-           --finetune-dataset alpaca \
-           --finetune-train-nsamples 8000 \
-           --finetune-train-seqlen 1024 \
-           --finetune-train-batch-size 3 \
-           --lora-alpha 10 \
-           --lora-r 32 \
-           --lora-dropout 0.05 \
-           --lora-target-option attn_head_and_mlp \
-           --eval-steps 16 \
-           --save-steps 16 \
-           --no-wandb
+## Quick Start
+
+### Running Global PCA SliceGPT
+
+```bash
+python experiments/run_slicegpt_global.py \
+    --model facebook/opt-125m \
+    --sparsity 0.25 \
+    --use-global-pca \
+    --device cuda:0 \
+    --no-wandb
 ```
 
-Notes: 
-- The script [`bo_finetuning.py`](./experiments/bo_finetuning.py) can be used to run Bayesian optimization over the RFT hyperparameters.
-- To run finetuning on the original model, specify `--model-path` instead of `--sliced-model-path`. 
-- `sparsity` must be specified when specifying `sliced-model-path` to avoid default sparsity being used
+### Standard Per-Layer SliceGPT (original)
 
-### Evaluation using the [LM Eval Harness](https://github.com/EleutherAI/lm-evaluation-harness) 
-```
-    python run_lm_eval.py \
-           --model microsoft/phi-2 \
-           --sliced-model-path path/to/sliced \
-           --sparsity 0.25 \
-           --tasks piqa \
-           --no-wandb
+```bash
+python experiments/run_slicegpt.py \
+    --model facebook/opt-125m \
+    --sparsity 0.25 \
+    --device cuda:0 \
+    --no-wandb
 ```
 
-Notes: 
-- To run lm-eval on the original model, specify `--model-path` instead of `--sliced-model-path`. 
-- `sparsity` must be specified when specifying `sliced-model-path` to avoid default sparsity being used
+---
 
-## Supported models
+## New Functions
 
-The following models from Hugging Face hub are currently supported
-- [microsoft/phi-2](https://huggingface.co/microsoft/phi-2)
-- [microsoft/Phi-3-mini-4k-instruct](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct)
-- [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b)
-- [meta-llama/Llama-2-13b-hf](https://huggingface.co/meta-llama/Llama-2-13b)
-- [meta-llama/Llama-2-70b-hf](https://huggingface.co/meta-llama/Llama-2-70b)
-- [meta-llama/Meta-Llama-3-8B](https://huggingface.co/meta-llama/Meta-Llama-3-8B)
-- [meta-llama/Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct)
-- [meta-llama/Meta-Llama-3-70B](https://huggingface.co/meta-llama/Meta-Llama-3-70B)
-- [meta-llama/Meta-Llama-3-70B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-70B-Instruct)
-- [facebook/opt-125m](https://huggingface.co/facebook/opt-125m)
-- [facebook/opt-1.3b](https://huggingface.co/facebook/opt-1.3b)
-- [facebook/opt-2.7b](https://huggingface.co/facebook/opt-2.7b)
-- [facebook/opt-6.7b](https://huggingface.co/facebook/opt-6.7b)
-- [facebook/opt-13b](https://huggingface.co/facebook/opt-13b)
-- [facebook/opt-30b](https://huggingface.co/facebook/opt-30b)
-- [facebook/opt-66b](https://huggingface.co/facebook/opt-66b)
+The following functions were added to `src/slicegpt/rotate.py`:
 
-## Extending support to a new model type
+| Function | Description |
+|----------|-------------|
+| `rotate_and_slice_global_pca()` | Single rotation matrix for all layers |
+| `rotate_and_slice_kblock()` | K-block hybrid (experimental) |
+| `collect_global_covariance()` | Aggregates covariance across all layers |
 
-The model you wish to support must be in Hugging Face Hub format. The model files can be downloaded from 
-Hugging Face Hub by supplying `--model` argument, or accessed from local storage by using the `--model` and 
-`--model-path` argument. To add SliceGPT support for a new model, one needs to implement a new model adapter 
-and update `hf_utils.get_model_and_tokenizer` before slicing the new model.
+---
 
-### Implementing a new model adapter
-- Implement the [ModelAdapter](./src/slicegpt/model_adapter.py) interface for the new model. The ModelAdapter class tells SliceGPT 
-  how to interact with the model, an instance of which is stored at `self.model`. For example, 
-  how to access each of the layers of the model.
-- Implement the [LayerAdapter](./src/slicegpt/model_adapter.py) interface for the transformer layers. 
-  The LayerAdapter class tells SliceGPT how to interact 
-  with each transformer layer of the model, an instance of which is stored at `self.layer`. 
-  For example, how to access the attention and MLP components of the transformer layer, and 
-  how to update the arguments to the transformer layer's forward method.
-- Implement a compressed transformer layer class that subclasses the transformer layer. 
-  This class should also  provide an adapted `forward()` method to work with the compressed model. 
-  This method should specify how the skip connection orthogonal matrices are used, depending on 
-  whether MLP and attention blocks are sequential ([OPT](./src/slicegpt/adapters/opt_adapter.py), 
-  [Llama-2/Llama-3](./src/slicegpt/adapters/llama_adapter.py)) or parallel 
-  ([Phi-2](./src/slicegpt/adapters/phi2_adapter.py)). The `self.*_shortcut_Q` matrices are attached to the modules during
-  slicing and are available in `forward()`. If the skip connection does not need modification, these matrices will be None, 
-  and the `forward()` method can follow the original workflow. For more details on this, 
-  please read Section 3 in [the paper](https://arxiv.org/abs/2401.15024).
+## K-Block Study (Negative Result)
 
-Example: [llama_adapter.py](./src/slicegpt/adapters/llama_adapter.py)
+We also investigated **K-block rotation**: grouping layers into K blocks, each with a shared rotation matrix. This was expected to provide a middle ground between per-layer and global PCA.
 
-### Using a new model adapter to slice a model
-Once a model adapter is implemented, compressing the model involves three conceptual steps:
-  - Replace modules with compressed equivalents (via `slicegpt.layernorm_fusion.replace_layers`)
-  - Fuse layer norms and add rotations to skip connections (via `slicegpt.layernorm_fusion.fuse_modules`)
-  - Rotate the inputs and slice the layers (via `slicegpt.rotate.rotate_and_slice`)
+**Finding:** K-block rotation fails catastrophically for intermediate K values due to information loss at block boundaries. Only K=1 (per-layer) and K=L (global) are practical.
 
-Example: [run_slicegpt.py](./experiments/run_slicegpt.py)
+| K | Perplexity |
+|---|------------|
+| 1 (per-layer) | 39.60 |
+| 2 | 1942 ❌ |
+| 4 | 300 ❌ |
+| 12 (global) | 44.31 ✓ |
 
-_Note:_ If the model you wish to support is not available in Hugging Face, you will also need to implement 
-custom model loading and initialization functionality.
+See [`experiments/KBLOCK_DESIGN.md`](experiments/KBLOCK_DESIGN.md) for full analysis.
 
-## Contributing
+---
 
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
+## Experiment Results
 
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
+All experimental results are in the `results/` folder:
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+| Study | Description |
+|-------|-------------|
+| `global_pca_study/` | Global vs per-layer PCA comparison |
+| `calibration_study/` | Effect of calibration samples on perplexity |
+| `throughput_study/` | Inference speed and memory benchmarks |
+| `llama_study/` | Results on LLaMA-7B |
+| `kblock_full_study/` | K-block ablation (negative result) |
 
-## Trademarks
+---
 
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow 
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
-Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply 
-Microsoft sponsorship.
+## Installation
 
-Any use of third-party trademarks or logos are subject to those third-party's policies.
+```bash
+pip install -e .[experiment]
+```
 
+For fine-tuning support:
+```bash
+pip install -e .[experiment,finetune]
+```
+
+---
+
+## Supported Models
+
+Same as original SliceGPT:
+- OPT family (125M to 66B)
+- LLaMA-2/3 family
+- Phi-2, Phi-3
+
+---
+
+## Citation
+
+If you use this work, please cite the original SliceGPT paper:
+
+```bibtex
+@inproceedings{ashkboos2024slicegpt,
+  title={SliceGPT: Compress Large Language Models by Deleting Rows and Columns},
+  author={Ashkboos, Saleh and others},
+  booktitle={ICLR},
+  year={2024}
+}
+```
+
+---
+
+## License
+
+MIT License (inherited from original repository)
+
+## Acknowledgments
+
+This work builds on [SliceGPT](https://arxiv.org/abs/2401.15024) by Microsoft Research.

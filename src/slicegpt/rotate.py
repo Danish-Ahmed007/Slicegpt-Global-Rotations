@@ -29,7 +29,9 @@ def slice_attention_inputs(layer_adapter: LayerAdapter, new_embedding_dimension:
         W.weight.data = W.weight.data[:, :new_embedding_dimension]
         W.in_features = new_embedding_dimension
 
-    layer_adapter.layer.attn_shortcut_Q = nn.Parameter(layer_adapter.layer.attn_shortcut_Q[:new_embedding_dimension, :])
+    # Skip shortcut slicing if None (e.g., for global PCA where shortcuts are eliminated)
+    if layer_adapter.layer.attn_shortcut_Q is not None:
+        layer_adapter.layer.attn_shortcut_Q = nn.Parameter(layer_adapter.layer.attn_shortcut_Q[:new_embedding_dimension, :])
 
 
 def rotate_attention_output(layer_adapter: LayerAdapter, Q: torch.Tensor) -> None:
@@ -526,3 +528,419 @@ def pca_calc(
     eig_val = X_eig[0][index]
     eigen_vec = X_eig[1][:, index]
     return eig_val, eigen_vec
+
+#### Global PCA Implementation ####
+
+@torch.no_grad()
+def collect_global_covariance(
+    model_adapter: ModelAdapter,
+    dataloader: torch.utils.data.DataLoader[torch.Tensor],
+    apply_mask: bool = True,
+) -> torch.Tensor:
+    """
+    Compute global covariance by aggregating layer 0 inputs and all layer outputs.
+    """
+    model_adapter.model.eval()
+    
+    inps, args, kwargs, ignore_masks = [], [], [], []
+    for batch in dataloader:
+        inp_batch, args_batch, kwargs_batch = get_layer0_inputs(model_adapter, batch)
+        inps.append(inp_batch)
+        args.append(args_batch)
+        kwargs.append(kwargs_batch)
+        if apply_mask:
+            ignore_masks.append(batch["attention_mask"])
+    
+    H = None
+    for idx, X_batch in enumerate(inps):
+        X_batch_masked = X_batch.clone()
+        if ignore_masks:
+            X_batch_masked[ignore_masks[idx] == 0] = 0
+        X_batch_masked = X_batch_masked.double().to(device=config.device)
+        H_batch = torch.sum(X_batch_masked.mT @ X_batch_masked, dim=0)
+        H = H_batch if H is None else H + H_batch
+        del X_batch_masked, H_batch
+    
+    cleanup_memory()
+    
+    layers = model_adapter.get_layers()
+    current_inps = inps
+    
+    for layer_idx, layer_adapter in enumerate(tqdm(layers, unit="layer", desc="Collecting global covariance")):
+        layer = layer_adapter.layer.to(config.device)
+        layer_outputs = []
+        for i, inp in enumerate(current_inps):
+            layer_args = layer_adapter.get_updated_args(inp, args[i])
+            layer_args = map_tensors(layer_args, device=config.device)
+            layer_kwargs = map_tensors(kwargs[i], device=config.device)
+            
+            out = layer(*layer_args, **layer_kwargs)
+            if isinstance(out, tuple):
+                out = out[layer_adapter.hidden_states_output_position]
+            layer_outputs.append(out.cpu())
+        for idx, X_batch in enumerate(layer_outputs):
+            X_batch_masked = X_batch.clone()
+            if ignore_masks:
+                X_batch_masked[ignore_masks[idx] == 0] = 0
+            X_batch_masked = X_batch_masked.double().to(device=config.device)
+            H_batch = torch.sum(X_batch_masked.mT @ X_batch_masked, dim=0)
+            H = H + H_batch
+            del X_batch_masked, H_batch
+        current_inps = layer_outputs
+        layer.cpu()
+        cleanup_memory()
+    return H
+
+
+@torch.no_grad()
+def rotate_and_slice_global_pca(
+    model_adapter: ModelAdapter,
+    dataloader: torch.utils.data.DataLoader[torch.Tensor],
+    slicing_scheduler: SlicingScheduler,
+    apply_mask: bool = True,
+    final_orientation: str = 'pca',
+) -> None:
+    """
+    Rotate and slice using a single global PCA basis for all layers.
+    """
+    model_adapter.model.eval()
+    dtype = next(iter(model_adapter.model.parameters())).dtype
+    
+    layers = model_adapter.get_layers()
+    slicing_scheduler.setup(
+        hidden_size=model_adapter.hidden_size, 
+        layers_num=len(layers), 
+        parallel_blocks=model_adapter.parallel_blocks
+    )
+    
+    # compute global covariance and eigendecomposition
+    H = collect_global_covariance(model_adapter, dataloader, apply_mask)
+    damp = 0.01 * torch.mean(torch.diag(H))
+    diag = torch.arange(H.shape[-1]).to(device=config.device)
+    H[diag, diag] = H[diag, diag] + damp
+    X_eig = torch.linalg.eigh(H)
+    del H
+    
+    index = torch.argsort(X_eig[0], descending=True)
+    Q_global = X_eig[1][:, index].to(device=config.device)
+    
+    if final_orientation == 'random':
+        R = random_orthogonal_upper_left(Q_global.shape[0], slicing_scheduler.get_embedding_dimensions()[0])
+        Q_global = Q_global @ R.to(Q_global.device, dtype=torch.float64)
+    
+    # rotate and slice embeddings
+    rotate_embeddings(model_adapter, Q_global)
+    slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
+
+    is_last_layer_special = not slicing_scheduler.do_slice_head
+    
+    for idx, layer_adapter in enumerate(tqdm(layers, unit="layer", desc="Processing layers")):
+        layer = layer_adapter.layer
+        is_last_layer = (idx == len(layers) - 1)
+        
+        if not model_adapter.parallel_blocks:
+            # Sequential blocks case (like OPT, LLaMA)
+            new_attn_in_dim = slicing_scheduler.get_attention_input_dimension(idx)
+            new_attn_out_dim = slicing_scheduler.get_attention_output_dimension(idx, match_head_dim=False)
+            new_mlp_in_dim = slicing_scheduler.get_mlp_input_dimension(idx)
+            new_mlp_out_dim = slicing_scheduler.get_mlp_output_dimension(idx)
+
+            # attention shortcut: None for global PCA
+            layer.attn_shortcut_Q = None
+            
+            rotate_attention_inputs(layer_adapter, Q_global)
+            slice_attention_inputs(layer_adapter, new_attn_in_dim)
+            rotate_attention_output(layer_adapter, Q_global)
+            slice_attention_output(layer_adapter, new_attn_out_dim)
+            
+
+            # mlp shortcut: None unless last layer with different output dimension
+            if is_last_layer and is_last_layer_special and new_mlp_in_dim != new_mlp_out_dim:
+                layer.mlp_shortcut_Q = nn.Parameter(
+                    torch.eye(new_mlp_in_dim, new_mlp_out_dim, dtype=dtype, device='cpu')
+                )
+            else:
+                layer.mlp_shortcut_Q = None
+
+            rotate_mlp_input(layer_adapter, Q_global)
+            slice_mlp_input(layer_adapter, new_mlp_in_dim)
+            rotate_mlp_output(layer_adapter, Q_global)
+            slice_mlp_output(layer_adapter, new_mlp_out_dim)
+            
+        else:
+            new_in_dim = slicing_scheduler.get_attention_input_dimension(idx)
+            new_out_dim = slicing_scheduler.get_mlp_output_dimension(idx)
+
+            if is_last_layer and is_last_layer_special and new_in_dim != new_out_dim:
+                layer.attn_shortcut_Q = nn.Parameter(
+                    torch.eye(new_in_dim, new_out_dim, dtype=dtype, device='cpu')
+                )
+            else:
+                layer.attn_shortcut_Q = None
+            
+            # Rotate all inputs and outputs with global Q
+            rotate_attention_inputs(layer_adapter, Q_global)
+            rotate_mlp_input(layer_adapter, Q_global)
+            slice_attention_inputs(layer_adapter, new_in_dim)
+            slice_mlp_input(layer_adapter, new_in_dim)
+            
+            rotate_attention_output(layer_adapter, Q_global)
+            rotate_mlp_output(layer_adapter, Q_global)
+            slice_attention_output(layer_adapter, new_out_dim)
+            slice_mlp_output(layer_adapter, new_out_dim)
+        
+        layer.to('cpu')
+        cleanup_memory()
+    
+    # Step 6: Rotate and slice head
+    logging.info("Rotating head with global Q...")
+    rotate_head(model_adapter, Q_global)
+    if slicing_scheduler.do_slice_head:
+        slice_head(model_adapter, slicing_scheduler.get_head_dimension())
+    
+    # Store slicing configuration
+    model_adapter.slicing_conf = slicing_scheduler.slicing_conf.clone()
+    
+    logging.info("=" * 60)
+    logging.info("GLOBAL PCA: Rotation and slicing complete!")
+    logging.info("MEMORY SAVINGS: Shortcut matrices eliminated (except last layer if needed)")
+    logging.info("=" * 60)
+
+
+
+
+# K-Block PCA: Groups of K layers share a single rotation matrix.
+
+
+@torch.no_grad()
+def rotate_and_slice_kblock(
+    model_adapter: ModelAdapter,
+    dataloader: torch.utils.data.DataLoader[torch.Tensor],
+    slicing_scheduler: SlicingScheduler,
+    k_block: int,
+    apply_mask: bool = True,
+    final_orientation: str = 'pca',
+) -> dict:
+    """
+    Rotate and slice with K layers per block sharing a rotation matrix.
+    """
+    model = model_adapter.model
+    model.eval()
+    dtype = next(model.parameters()).dtype
+    
+    layers = list(model_adapter.get_layers())
+    num_layers = len(layers)
+    
+    if k_block < 1 or k_block > num_layers:
+        raise ValueError(f"k_block must be between 1 and {num_layers}, got {k_block}")
+    
+    # redirect to optimized implementations for edge cases
+    if k_block == num_layers:
+        rotate_and_slice_global_pca(
+            model_adapter, dataloader, slicing_scheduler,
+            apply_mask=apply_mask, final_orientation=final_orientation
+        )
+        return {"k_block": k_block, "num_blocks": 1, "shortcuts_stored": 1, "shortcuts_eliminated": num_layers * 2 - 1}
+
+    if k_block == 1:
+        rotate_and_slice_sequential(
+            model_adapter, dataloader, slicing_scheduler,
+            apply_mask=apply_mask, final_orientation=final_orientation
+        )
+        return {"k_block": 1, "num_blocks": num_layers, "shortcuts_stored": 2 * num_layers, "shortcuts_eliminated": 0}
+    
+    # Setup
+    slicing_scheduler.setup(
+        hidden_size=model_adapter.hidden_size,
+        layers_num=num_layers,
+        parallel_blocks=model_adapter.parallel_blocks
+    )
+    
+    # calculate block structure
+    num_full_blocks = num_layers // k_block
+    num_blocks = num_full_blocks + (1 if num_layers % k_block > 0 else 0)
+    
+    block_ranges = []
+    layer_to_block = {}
+    for block_idx in range(num_blocks):
+        start = block_idx * k_block
+        end = min((block_idx + 1) * k_block, num_layers)
+        block_ranges.append((start, end))
+        for layer_idx in range(start, end):
+            layer_to_block[layer_idx] = block_idx
+    
+    logging.info("=" * 60)
+    logging.info(f"K-BLOCK PCA V2: K={k_block}")
+    logging.info("=" * 60)
+    logging.info(f"Layers: {num_layers}, Blocks: {num_blocks}")
+    for i, (s, e) in enumerate(block_ranges):
+        logging.info(f"  Block {i}: Layers {s}-{e-1}")
+    
+    # collect covariances for all blocks from original model
+    inps, args, kwargs, ignore_masks = [], [], [], []
+    for batch in dataloader:
+        inp_batch, args_batch, kwargs_batch = get_layer0_inputs(model_adapter, batch)
+        inps.append(inp_batch)
+        args.append(args_batch)
+        kwargs.append(kwargs_batch)
+        if apply_mask:
+            ignore_masks.append(batch["attention_mask"])
+    
+    block_covariances = [None] * num_blocks
+    for idx, X_batch in enumerate(inps):
+        X_batch_masked = X_batch.clone()
+        if ignore_masks:
+            X_batch_masked[ignore_masks[idx] == 0] = 0
+        X_batch_masked = X_batch_masked.double().to(device=config.device)
+        H_batch = torch.sum(X_batch_masked.mT @ X_batch_masked, dim=0)
+        block_covariances[0] = H_batch if block_covariances[0] is None else block_covariances[0] + H_batch
+        del X_batch_masked, H_batch
+    
+    current_inps = inps
+    for layer_idx, layer_adapter in enumerate(tqdm(layers, unit="layer", desc="Collecting covariances")):
+        layer = layer_adapter.layer.to(config.device)
+        block_idx = layer_to_block[layer_idx]
+        layer_outputs = []
+        for i, inp in enumerate(current_inps):
+            layer_args = layer_adapter.get_updated_args(inp, args[i])
+            layer_args = map_tensors(layer_args, device=config.device)
+            layer_kwargs = map_tensors(kwargs[i], device=config.device)
+            
+            out = layer(*layer_args, **layer_kwargs)
+            if isinstance(out, tuple):
+                out = out[layer_adapter.hidden_states_output_position]
+            layer_outputs.append(out.cpu())
+        for idx, X_batch in enumerate(layer_outputs):
+            X_batch_masked = X_batch.clone()
+            if ignore_masks:
+                X_batch_masked[ignore_masks[idx] == 0] = 0
+            X_batch_masked = X_batch_masked.double().to(device=config.device)
+            H_batch = torch.sum(X_batch_masked.mT @ X_batch_masked, dim=0)
+            if block_covariances[block_idx] is None:
+                block_covariances[block_idx] = H_batch
+            else:
+                block_covariances[block_idx] = block_covariances[block_idx] + H_batch
+            del X_batch_masked, H_batch
+        
+        current_inps = layer_outputs
+        layer.cpu()
+        cleanup_memory()
+    
+    # compute Q matrices for all blocks
+    Q_blocks = []
+    embedding_dim = slicing_scheduler.get_embedding_dimensions()[0]
+    
+    for block_idx in range(num_blocks):
+        H_block = block_covariances[block_idx]
+
+        damp = 0.01 * torch.mean(torch.diag(H_block))
+        diag_idx = torch.arange(H_block.shape[-1]).to(device=config.device)
+        H_block[diag_idx, diag_idx] = H_block[diag_idx, diag_idx] + damp
+        
+        X_eig = torch.linalg.eigh(H_block)
+        index = torch.argsort(X_eig[0], descending=True)
+        Q_block = X_eig[1][:, index].to(device=config.device, dtype=torch.float64)
+        
+        if final_orientation == 'random':
+            R = random_orthogonal_upper_left(Q_block.shape[0], embedding_dim)
+            Q_block = Q_block @ R.to(Q_block.device, dtype=torch.float64)
+        
+        Q_blocks.append(Q_block)
+        block_covariances[block_idx] = None
+    
+    # apply rotations and slicing
+    rotate_embeddings(model_adapter, Q_blocks[0])
+    slice_embeddings(model_adapter, slicing_scheduler.get_embedding_dimensions())
+    
+    shortcuts_stored = 0
+    is_last_layer_special = not slicing_scheduler.do_slice_head
+    
+    for layer_idx, layer_adapter in enumerate(tqdm(layers, unit="layer", desc="Rotating and slicing")):
+        layer = layer_adapter.layer.to(config.device)
+        block_idx = layer_to_block[layer_idx]
+        Q_block = Q_blocks[block_idx]
+        
+        is_first_in_block = (layer_idx == block_ranges[block_idx][0])
+        is_last_layer = (layer_idx == num_layers - 1)
+        
+        # Get dimensions
+        new_attn_in_dim = slicing_scheduler.get_attention_input_dimension(layer_idx)
+        new_attn_out_dim = slicing_scheduler.get_attention_output_dimension(layer_idx, match_head_dim=False)
+        new_mlp_in_dim = slicing_scheduler.get_mlp_input_dimension(layer_idx)
+        new_mlp_out_dim = slicing_scheduler.get_mlp_output_dimension(layer_idx)
+        
+        if not model_adapter.parallel_blocks:
+            # block boundary shortcut
+            if is_first_in_block and block_idx > 0:
+                Q_prev = Q_blocks[block_idx - 1]
+                shortcut = torch.matmul(Q_prev[:, :new_attn_in_dim].T, Q_block[:, :new_attn_in_dim])
+                layer.attn_shortcut_Q = nn.Parameter(shortcut.to(dtype=dtype, device="cpu"))
+                shortcuts_stored += 1
+            else:
+                layer.attn_shortcut_Q = None
+            
+            # Rotate and slice attention
+            rotate_attention_inputs(layer_adapter, Q_block)
+            slice_attention_inputs(layer_adapter, new_attn_in_dim)
+            rotate_attention_output(layer_adapter, Q_block)
+            slice_attention_output(layer_adapter, new_attn_out_dim)
+            
+            if is_last_layer and is_last_layer_special and new_mlp_in_dim != new_mlp_out_dim:
+                layer.mlp_shortcut_Q = nn.Parameter(
+                    torch.eye(new_mlp_in_dim, new_mlp_out_dim, dtype=dtype, device='cpu')
+                )
+                shortcuts_stored += 1
+            else:
+                layer.mlp_shortcut_Q = None
+            
+            # Rotate and slice MLP
+            rotate_mlp_input(layer_adapter, Q_block)
+            slice_mlp_input(layer_adapter, new_mlp_in_dim)
+            rotate_mlp_output(layer_adapter, Q_block)
+            slice_mlp_output(layer_adapter, new_mlp_out_dim)
+            
+        else:
+            new_in_dim = slicing_scheduler.get_attention_input_dimension(layer_idx)
+            new_out_dim = slicing_scheduler.get_mlp_output_dimension(layer_idx)
+
+            if is_first_in_block and block_idx > 0:
+                Q_prev = Q_blocks[block_idx - 1]
+                shortcut = torch.matmul(Q_prev[:, :new_in_dim].T, Q_block[:, :new_in_dim])
+                layer.attn_shortcut_Q = nn.Parameter(shortcut.to(dtype=dtype, device="cpu"))
+                shortcuts_stored += 1
+            elif is_last_layer and is_last_layer_special and new_in_dim != new_out_dim:
+                layer.attn_shortcut_Q = nn.Parameter(
+                    torch.eye(new_in_dim, new_out_dim, dtype=dtype, device='cpu')
+                )
+                shortcuts_stored += 1
+            else:
+                layer.attn_shortcut_Q = None
+            
+            rotate_attention_inputs(layer_adapter, Q_block)
+            rotate_mlp_input(layer_adapter, Q_block)
+            slice_attention_inputs(layer_adapter, new_in_dim)
+            slice_mlp_input(layer_adapter, new_in_dim)
+            rotate_attention_output(layer_adapter, Q_block)
+            rotate_mlp_output(layer_adapter, Q_block)
+            slice_attention_output(layer_adapter, new_out_dim)
+            slice_mlp_output(layer_adapter, new_out_dim)
+        
+        layer.to("cpu")
+        cleanup_memory()
+    
+    rotate_head(model_adapter, Q_blocks[-1])
+    if slicing_scheduler.do_slice_head:
+        slice_head(model_adapter, slicing_scheduler.get_head_dimension())
+
+    model_adapter.slicing_conf = slicing_scheduler.slicing_conf.clone()
+
+    total_possible = 2 * num_layers if not model_adapter.parallel_blocks else num_layers
+    eliminated = total_possible - shortcuts_stored
+    logging.info(f"K-block rotation done. Shortcuts: {shortcuts_stored} stored, {eliminated} eliminated")
+    
+    return {
+        "k_block": k_block,
+        "num_blocks": num_blocks,
+        "shortcuts_stored": shortcuts_stored,
+        "shortcuts_eliminated": eliminated,
+    }
